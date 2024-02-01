@@ -1,0 +1,5 @@
+include curate/**/*.yaml
+include curate/**/*.yml
+include curate/**/*.json
+include curate/**/Snakefile
+include curate/**/*.smk

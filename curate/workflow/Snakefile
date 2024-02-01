@@ -1,0 +1,92 @@
+from snakebids import bids, generate_inputs, get_wildcard_constraints
+import pandas as pd
+from pathlib import Path
+
+configfile: 'config/snakebids.yml'
+
+bad_vols = pd.read_csv(
+    config["bad_vols_file"],
+    delimiter="\t",
+    index_col=["subject", "session"],
+    dtype={"subject": "str", "session": "str", "bad_vols": "str"},
+)
+
+
+def strip_suffixes(path):
+    if path.stem == path.name:
+        return path
+    return strip_suffixes(path.with_suffix(""))
+
+# Get input wildcards
+inputs = generate_inputs(
+    bids_dir=config["bids_dir"],
+    pybids_inputs=config["pybids_inputs"],
+    pybidsdb_dir=config.get("pybidsdb_dir"),
+    pybidsdb_reset=config.get("pybidsdb_reset"),
+    derivatives=config.get("derivatives", None),
+    participant_label=config.get("participant_label", None),
+    exclude_participant_label=config.get("exclude_participant_label", None),
+    validate=not config.get("plugins.validator.skip", False)
+)
+
+def get_entities(comp, **updates):
+    entities = inputs.layout.get_file(inputs[comp].expand()[0]).get_entities()
+    for wcard in inputs[comp].wildcards:
+        del entities[wcard]
+    entities.update(**updates)
+    return entities
+
+def get_bad_vols(wcards):
+    vals = bad_vols.loc[wcards["subject"], wcards["session"]]["bad_vols"]
+    if pd.isna(vals):
+        return ''
+    return r"^({})$".format(vals.strip(",").replace(",", "|"))
+
+rule remove_bad_dwi_volumes:
+    input:
+        img=inputs["data"].path,
+        bvec=strip_suffixes(Path(inputs["data"].path)).with_suffix(".bvec"),
+        bval=strip_suffixes(Path(inputs["data"].path)).with_suffix(".bval"),
+    output:
+        img=bids(
+            config["output_dir"],
+            **get_entities("data"),
+            **inputs["data"].wildcards,
+        ),
+        bvec=bids(
+            config["output_dir"],
+            **get_entities("data", extension=".bvec"),
+            **inputs["data"].wildcards,
+        ),
+        bval=bids(
+            config["output_dir"],
+            **get_entities("data", extension=".bval"),
+            **inputs["data"].wildcards,
+        ),
+    params:
+        bad_vols=get_bad_vols
+    singularity:
+        config["containers"]["mrtrix"]
+    shell:
+        """
+        if [[ -z '{params.bad_vols}' ]]; then
+            cp {input.img} {output.img}
+            cp {input.bval} {output.bval}
+            cp {input.bvec} {output.bvec}
+        else
+            selection="$(mrinfo -size {input.img} |
+                cut -d' ' -f4 |  # get the length of 4th dimension
+                xargs seq 0 |    # Turn into a sequence
+                head -n-1 |      # Exclude the last number in the sequence (equal to the dim lenth)
+                grep -Ev '{params.bad_vols}' |
+                paste -s -d',')"
+            mrconvert {input.img} -fslgrad {input.bvec} {input.bval} \\
+                -coord 3 "$selection" \\
+                {output.img} -export_grad_fsl {output.bvec} {output.bval}
+        fi
+        """
+
+rule all:
+    default_target: True
+    input:
+        inputs["data"].expand(rules.remove_bad_dwi_volumes.output)
